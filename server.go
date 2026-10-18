@@ -29,15 +29,25 @@ func (this *Server) BroadcastMessage(user *User, msg string) {
 }
 
 func (this *Server) Handler(conn net.Conn) {
-	fmt.Println("New connection from:", conn.RemoteAddr().String()) 
-	user := NewUser(conn)
-	this.mapLock.Lock()
-	this.OnlineMap[user.Name] = user
-	this.mapLock.Unlock()
+	fmt.Println("New connection from:", conn.RemoteAddr().String())
+	user := NewUser(conn, this)
 
-	this.BroadcastMessage(user, "已上线")
+	// 用户上线
+	user.Online()
 
-	select {}
+	// 接收用户消息
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := conn.Read(buf)
+			if n == 0 || err != nil {
+				user.Offline()
+				return
+			}
+			msg := string(buf[:n-1])
+			user.DoMessage(msg)
+		}
+	}()
 }
 func NewServer(ip string, port int) *Server {
 	server := &Server{
