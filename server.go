@@ -1,18 +1,21 @@
 package main
 
-import ("net"
-"fmt"
-"sync")
+import (
+	"fmt"
+	"net"
+	"sync"
+)
 
 type Server struct {
 	Ip   string
 	Port int
 
 	OnlineMap map[string]*User
-	mapLock sync.RWMutex
+	mapLock   sync.RWMutex
 
-	Message chan string 
+	Message chan string
 }
+
 func (this *Server) ListenMessage() {
 	for {
 		msg := <-this.Message
@@ -24,7 +27,7 @@ func (this *Server) ListenMessage() {
 	}
 }
 func (this *Server) BroadcastMessage(user *User, msg string) {
-	sendMsg :="[" + user.Addr + "]" + user.Name + ":" + msg 
+	sendMsg := "[" + user.Addr + "]" + user.Name + ":" + msg
 	this.Message <- sendMsg
 }
 
@@ -51,16 +54,16 @@ func (this *Server) Handler(conn net.Conn) {
 }
 func NewServer(ip string, port int) *Server {
 	server := &Server{
-		Ip:   ip,
-		Port: port,
+		Ip:        ip,
+		Port:      port,
 		OnlineMap: make(map[string]*User),
-		Message: make(chan string),
+		Message:   make(chan string),
 	}
 	return server
 }
 
 func (this *Server) Start() {
-	listener , err := net.Listen("tcp", fmt.Sprintf("%s:%d", this.Ip, this.Port))
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", this.Ip, this.Port))
 	if err != nil {
 		fmt.Println("Error starting server:", err)
 		return

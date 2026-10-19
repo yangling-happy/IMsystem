@@ -7,7 +7,7 @@ type User struct {
 	Addr string
 	C    chan string
 	conn net.Conn
-	
+
 	server *Server
 }
 
@@ -21,27 +21,27 @@ func NewUser(conn net.Conn, server *Server) *User {
 
 		server: server,
 	}
-	go user.ListenMessage() 
+	go user.ListenMessage()
 	return user
 }
-func (this * User)Online () {
-		this.server.mapLock.Lock()
+func (this *User) Online() {
+	this.server.mapLock.Lock()
 	this.server.OnlineMap[this.Name] = this
 	this.server.mapLock.Unlock()
 	this.server.BroadcastMessage(this, "已上线")
 }
 
-func (this * User)Offline () {
+func (this *User) Offline() {
 	this.server.mapLock.Lock()
 	delete(this.server.OnlineMap, this.Name)
 	this.server.mapLock.Unlock()
 	this.server.BroadcastMessage(this, "已下线")
 	this.conn.Close()
 }
-func (this * User) SendMessage(msg string) { 
+func (this *User) SendMessage(msg string) {
 	this.conn.Write([]byte(msg))
 }
-func (this * User) DoMessage(msg string) {
+func (this *User) DoMessage(msg string) {
 
 	if msg == "who" {
 		this.server.mapLock.Lock()
@@ -51,8 +51,21 @@ func (this * User) DoMessage(msg string) {
 		}
 		this.server.mapLock.Unlock()
 		return
+	} else if len(msg) > 7 && msg[:7] == "rename|" {
+		newName := msg[7:]
+		_, ok := this.server.OnlineMap[newName]
+		if ok {
+			this.SendMessage("当前用户名被使用\n")
+		} else {
+			this.server.mapLock.Lock()
+			delete(this.server.OnlineMap, this.Name)
+			this.Name = newName
+			this.server.OnlineMap[newName] = this
+			this.server.mapLock.Unlock()
+		}
+	} else {
+		this.server.BroadcastMessage(this, msg)
 	}
-	this.server.BroadcastMessage(this, msg)
 }
 func (u *User) ListenMessage() {
 	for msg := range u.C {
