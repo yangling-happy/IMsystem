@@ -38,8 +38,20 @@ func (this * User)Offline () {
 	this.server.BroadcastMessage(this, "已下线")
 	this.conn.Close()
 }
-
+func (this * User) SendMessage(msg string) { 
+	this.conn.Write([]byte(msg))
+}
 func (this * User) DoMessage(msg string) {
+
+	if msg == "who" {
+		this.server.mapLock.Lock()
+		for _, user := range this.server.OnlineMap {
+			onlineMsg := "[" + user.Addr + "]" + user.Name + ":" + "已上线\n"
+			this.C <- onlineMsg
+		}
+		this.server.mapLock.Unlock()
+		return
+	}
 	this.server.BroadcastMessage(this, msg)
 }
 func (u *User) ListenMessage() {
