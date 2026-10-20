@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time" 
 )
 
 type Server struct {
@@ -37,7 +38,7 @@ func (this *Server) Handler(conn net.Conn) {
 
 	// 用户上线
 	user.Online()
-
+	isLive := make(chan bool) 
 	// 接收用户消息
 	go func() {
 		buf := make([]byte, 4096)
@@ -47,10 +48,21 @@ func (this *Server) Handler(conn net.Conn) {
 				user.Offline()
 				return
 			}
-			msg := string(buf[:n-1])
+			msg := string(buf[:n])
 			user.DoMessage(msg)
+			isLive <- true
 		}
 	}()
+	for {
+		select {
+		case <-isLive:
+		case <-time.After(time.Second * 10):
+			user.SendMessage("You have been disconnected due to inactivity.")
+			// 不要 close(user.C)，否则 BroadcastMessage 往已关闭 channel 发会 panic
+			conn.Close()
+			return
+		}
+	}
 }
 func NewServer(ip string, port int) *Server {
 	server := &Server{
