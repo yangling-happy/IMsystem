@@ -13,7 +13,7 @@ type Client struct {
 
 // NewClient 建立与服务器的 TCP 连接
 func NewClient(serverIP string, serverPort int) (*Client, error) {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", serverIP, serverPort))
+	conn, err := net.Dial("tcp", net.JoinHostPort(serverIP, fmt.Sprintf("%d", serverPort)))
 	if err != nil {
 		return nil, err
 	}

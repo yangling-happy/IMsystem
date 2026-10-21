@@ -1,2 +1,9 @@
+# 构建产物
+/bin/
+*.exe
+chatserver
+chatserver.exe
+
+# netcat 测试工具
 nc.tar.gz
 tools/
