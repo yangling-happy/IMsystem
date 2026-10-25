@@ -9,6 +9,7 @@ import (
 type Client struct {
 	ServerIP   string
 	ServerPort int
+	Name       string
 	conn       net.Conn
 	choice     int
 }
@@ -43,6 +44,32 @@ func (client *Client) Menu() bool {
 		return false
 	}
 }
+func (client *Client) Update() bool {
+	fmt.Println("请输入用户名:")
+	fmt.Scanln(&client.Name)
+
+	sendMsg := "rename|" + client.Name + "\n"
+	_, err := client.conn.Write([]byte(sendMsg))
+	if err != nil {
+		fmt.Println("发送消息错误:", err)
+		return false
+	}
+	return true
+}
+
+// ReadServer 读取服务器发回的消息
+func (client *Client) ReadServer() {
+	buf := make([]byte, 4096)
+	for {
+		n, err := client.conn.Read(buf)
+		if err != nil {
+			fmt.Println("与服务器断开连接:", err)
+			return
+		}
+		fmt.Print(string(buf[:n]))
+	}
+}
+
 func (client *Client) Run() {
 	for client.choice != 0 {
 		for !client.Menu() {
@@ -56,6 +83,7 @@ func (client *Client) Run() {
 			break
 		case 3:
 			fmt.Println("更新用户名")
+			client.Update()
 			break
 		}
 	}
@@ -69,5 +97,6 @@ func main() {
 	}
 	defer client.conn.Close()
 	fmt.Println("连接服务器成功!")
+	go client.ReadServer()
 	client.Run()
 }

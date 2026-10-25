@@ -140,6 +140,11 @@ func (s *Server) rename(user *User, newName string) {
 		return
 	}
 	s.usersMu.Lock()
+	if newName == user.Name {
+		s.usersMu.Unlock()
+		user.Send("新用户名与当前用户名相同\n")
+		return
+	}
 	if _, exists := s.users[newName]; exists {
 		s.usersMu.Unlock()
 		user.Send("当前用户名被使用\n")
