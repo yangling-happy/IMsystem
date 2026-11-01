@@ -2,14 +2,17 @@ package imserver
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
 
 	"imsystem/internal/model"
 	"imsystem/internal/protocol"
+	"imsystem/internal/queue"
 )
 
 const (
@@ -32,6 +35,10 @@ type Server struct {
 
 	// HeartbeatTimeout 超过这个时长没收到任何报文，即判定掉线并断开。
 	HeartbeatTimeout time.Duration
+
+	// Sink 是消息入队口，nil 表示不持久化（P0 的无存储模式）。
+	// 由 cmd/server 注入，imserver 不关心背后是内存队列还是 Redis。
+	Sink queue.Sink
 
 	users   map[string]*User
 	usersMu sync.RWMutex
@@ -166,14 +173,47 @@ func (s *Server) handleEnvelope(user *User, env protocol.Envelope) {
 	case protocol.TypeChat:
 		if env.To == "" {
 			s.broadcastChat(user, env)
-			return
+		} else {
+			s.sendTo(user, env)
 		}
-		s.sendTo(user, env)
+		// 先投递再入队：投递是同步的（用户等着看消息），落库是异步的（不阻塞读循环）
+		s.enqueue(user, env)
 	default:
 		user.Send(protocol.Envelope{
 			Type: protocol.TypeNotice,
 			Body: "未知报文类型: " + env.Type,
 		})
+	}
+}
+
+// enqueue 把聊天消息转成 model.Message 并塞进缓冲队列。
+// 这里绝不能阻塞：读循环一旦被存储拖慢，整个连接的消息处理都会卡住。
+func (s *Server) enqueue(user *User, env protocol.Envelope) {
+	if s.Sink == nil {
+		return
+	}
+	chatType := model.ChatSingle
+	if env.To == "" {
+		chatType = model.ChatGroup
+	}
+
+	s.usersMu.RLock()
+	from := user.Name
+	s.usersMu.RUnlock()
+
+	m := model.Message{
+		MsgID:    env.MsgID,
+		From:     from,
+		To:       env.To,
+		ChatType: chatType,
+		Body:     env.Body,
+		SentAt:   time.Now(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := s.Sink.Push(ctx, m); err != nil {
+		log.Printf("消息入队失败 msg_id=%s err=%v", m.MsgID, err)
 	}
 }
 
