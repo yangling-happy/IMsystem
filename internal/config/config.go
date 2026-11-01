@@ -24,7 +24,9 @@ type Config struct {
 func Load() Config {
 	return Config{
 		Addr:             envStr("IM_ADDR", "0.0.0.0:8888"),
-		MySQLDSN:         envStr("IM_MYSQL_DSN", "root:root@tcp(127.0.0.1:3306)/imsystem?parseTime=true&charset=utf8mb4"),
+		// loc 必须与业务时区一致：DATETIME 本身不带时区，驱动若不指定 loc，
+		// 会把 time.Now() 按 UTC 写库，读出来就凭空差 8 小时。
+		MySQLDSN:         envStr("IM_MYSQL_DSN", "root:root@tcp(127.0.0.1:3306)/imsystem?parseTime=true&charset=utf8mb4&loc=Asia%2FShanghai"),
 		RedisAddr:        envStr("IM_REDIS_ADDR", "127.0.0.1:6379"),
 		RedisPass:        envStr("IM_REDIS_PASS", ""),
 
