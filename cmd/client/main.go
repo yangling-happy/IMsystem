@@ -150,6 +150,22 @@ func (client *Client) Update() bool {
 	return true
 }
 
+// heartbeatEvery 是客户端心跳间隔。服务端超时默认 90 秒，
+// 30 秒发一次意味着允许连续丢 2 次心跳仍不误杀。
+const heartbeatEvery = 30 * time.Second
+
+// HeartbeatLoop 定时发送心跳，让服务端知道"我还活着"。
+// 心跳本身不携带业务数据，它存在的唯一目的是刷新服务端的活跃时间。
+func (client *Client) HeartbeatLoop() {
+	ticker := time.NewTicker(heartbeatEvery)
+	defer ticker.Stop()
+	for range ticker.C {
+		if err := client.send(protocol.Envelope{Type: protocol.TypeHeartbeat}); err != nil {
+			return
+		}
+	}
+}
+
 // ReadServer 逐行读取服务器报文并渲染
 func (client *Client) ReadServer() {
 	scanner := bufio.NewScanner(client.conn)
@@ -161,6 +177,8 @@ func (client *Client) ReadServer() {
 			continue
 		}
 		switch env.Type {
+		case protocol.TypeHeartbeat:
+			// 服务端目前不回心跳；留这个分支是为了协议对称
 		case protocol.TypeChat:
 			if env.ChatType == string(model.ChatGroup) {
 				fmt.Printf("[公聊] %s: %s\n", env.From, env.Body)
@@ -200,6 +218,7 @@ func main() {
 	}
 	defer client.conn.Close()
 	fmt.Println("连接服务器成功!")
+	go client.HeartbeatLoop()
 	go client.ReadServer()
 	client.Run()
 }

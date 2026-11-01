@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"sync"
 	"time"
 
@@ -18,8 +17,12 @@ const (
 	// bufio.ErrTooLong，连接按异常断开处理。
 	maxLineBytes = 64 * 1024
 
-	// idleTimeout 是"多久没有收到任何报文就断开"。P2 会用心跳机制替换它。
-	idleTimeout = 10 * time.Second
+	// heartbeatCheckInterval 是巡检间隔：每 10 秒扫一遍在线用户。
+	// 掉线检测延迟上限 = HeartbeatTimeout + heartbeatCheckInterval。
+	heartbeatCheckInterval = 10 * time.Second
+
+	// closeDelay 让写协程有机会把"被断开"的提示刷出去，再真正关闭连接。
+	closeDelay = 100 * time.Millisecond
 )
 
 // Server 是用户管理与消息分发的中枢
@@ -27,15 +30,19 @@ type Server struct {
 	Ip   string
 	Port int
 
+	// HeartbeatTimeout 超过这个时长没收到任何报文，即判定掉线并断开。
+	HeartbeatTimeout time.Duration
+
 	users   map[string]*User
 	usersMu sync.RWMutex
 }
 
 func NewServer(ip string, port int) *Server {
 	return &Server{
-		Ip:    ip,
-		Port:  port,
-		users: make(map[string]*User),
+		Ip:               ip,
+		Port:             port,
+		HeartbeatTimeout: 90 * time.Second,
+		users:            make(map[string]*User),
 	}
 }
 
@@ -47,6 +54,9 @@ func (s *Server) Start() {
 	}
 	defer listener.Close()
 	fmt.Printf("服务器监听 %s:%d\n", s.Ip, s.Port)
+
+	// 心跳巡检：独立协程，不阻塞网络读写
+	go s.kickIdle()
 
 	for {
 		conn, err := listener.Accept()
@@ -67,7 +77,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	defer s.removeUser(user)
 
 	go user.WriteLoop()
-	defer close(user.send)
+	defer user.CloseSend()
 
 	s.broadcastNotice(user.Name + " 已上线")
 
@@ -75,19 +85,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	// 默认上限只有 bufio.MaxScanTokenSize（64KB），这里显式扩容并复用初始缓冲。
 	scanner.Buffer(make([]byte, 0, 1024), maxLineBytes)
 
-	for {
-		// 每次等待下一行前重置读超时：空闲过久就断开（P2 改为心跳驱动）
-		_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
-		if !scanner.Scan() {
-			if errors.Is(scanner.Err(), os.ErrDeadlineExceeded) {
-				user.Send(protocol.Envelope{
-					Type: protocol.TypeNotice,
-					Body: "你已因长时间无操作被断开",
-				})
-			}
-			_ = conn.Close()
-			return
-		}
+	for scanner.Scan() {
+		// 任何报文都算"我还活着"：聊天、查询、心跳都刷新活跃时间
+		user.Touch()
 
 		env, err := protocol.Decode(scanner.Bytes())
 		if err != nil {
@@ -103,6 +103,37 @@ func (s *Server) handleConn(conn net.Conn) {
 
 		s.handleEnvelope(user, env)
 	}
+
+	// 连接已由对方关闭、被心跳巡检踢掉，或读出错，统一走清理
+	_ = conn.Close()
+}
+
+// kickIdle 周期性检查在线用户，超时未活跃的断开。
+// 这是"网线被拔/进程被杀"这类没有 FIN 的病态断连的唯一检测手段。
+func (s *Server) kickIdle() {
+	ticker := time.NewTicker(heartbeatCheckInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		now := time.Now()
+
+		s.usersMu.RLock()
+		var idle []*User
+		for _, u := range s.users {
+			if now.Sub(u.LastActive()) > s.HeartbeatTimeout {
+				idle = append(idle, u)
+			}
+		}
+		s.usersMu.RUnlock()
+
+		for _, u := range idle {
+			u.Send(protocol.Envelope{
+				Type: protocol.TypeNotice,
+				Body: "心跳超时，连接已断开",
+			})
+			time.AfterFunc(closeDelay, u.Close)
+		}
+	}
 }
 
 // ---- 用户表操作 ----
@@ -115,9 +146,10 @@ func (s *Server) addUser(u *User) {
 
 func (s *Server) removeUser(u *User) {
 	s.usersMu.Lock()
-	delete(s.users, u.Name)
+	name := u.Name
+	delete(s.users, name)
 	s.usersMu.Unlock()
-	s.broadcastNotice(u.Name + " 已下线")
+	s.broadcastNotice(name + " 已下线")
 }
 
 // ---- 消息分发 ----
@@ -125,6 +157,8 @@ func (s *Server) removeUser(u *User) {
 // handleEnvelope 按报文类型分发。这里是"协议解释"的唯一入口。
 func (s *Server) handleEnvelope(user *User, env protocol.Envelope) {
 	switch env.Type {
+	case protocol.TypeHeartbeat:
+		// 心跳只需要刷新活跃时间（已在读循环里做过），不做业务分发
 	case protocol.TypeWho:
 		s.listUsers(user)
 	case protocol.TypeRename:
@@ -154,14 +188,16 @@ func (s *Server) broadcastNotice(msg string) {
 
 // broadcastChat 公聊：把发送者的消息原样广播给所有人（含自己）
 func (s *Server) broadcastChat(sender *User, env protocol.Envelope) {
+	s.usersMu.RLock()
+	// 在锁内读 sender.Name：改名会取写锁，这里拿读锁避免读到改名前后的撕裂值
+	from := sender.Name
 	out := protocol.Envelope{
 		Type:     protocol.TypeChat,
 		MsgID:    env.MsgID,
-		From:     sender.Name,
+		From:     from,
 		ChatType: string(model.ChatGroup),
 		Body:     env.Body,
 	}
-	s.usersMu.RLock()
 	for _, u := range s.users {
 		u.Send(out)
 	}
@@ -216,6 +252,7 @@ func (s *Server) sendTo(sender *User, env protocol.Envelope) {
 	}
 	s.usersMu.RLock()
 	target, ok := s.users[env.To]
+	from := sender.Name
 	s.usersMu.RUnlock()
 	if !ok {
 		sender.Send(protocol.Envelope{Type: protocol.TypeNotice, Body: "当前用户不存在"})
@@ -224,7 +261,7 @@ func (s *Server) sendTo(sender *User, env protocol.Envelope) {
 	target.Send(protocol.Envelope{
 		Type:     protocol.TypeChat,
 		MsgID:    env.MsgID,
-		From:     sender.Name,
+		From:     from,
 		To:       env.To,
 		ChatType: string(model.ChatSingle),
 		Body:     env.Body,

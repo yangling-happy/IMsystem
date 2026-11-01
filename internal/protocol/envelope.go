@@ -10,10 +10,11 @@ import (
 
 // 报文类型。目前只区分"谁在说话"，不做多余扩展。
 const (
-	TypeChat   = "chat"   // 聊天消息
-	TypeWho    = "who"    // 查询在线用户
-	TypeRename = "rename" // 改名
-	TypeNotice = "notice" // 服务端下发的系统提示
+	TypeChat      = "chat"      // 聊天消息
+	TypeWho       = "who"       // 查询在线用户
+	TypeRename    = "rename"    // 改名
+	TypeHeartbeat = "heartbeat" // 心跳，仅用于维持连接活跃
+	TypeNotice    = "notice"    // 服务端下发的系统提示
 )
 
 // Envelope 是传输层的一条报文。
@@ -52,7 +53,7 @@ func Decode(line []byte) (Envelope, error) {
 	}
 	if e.Type == "" {
 		var ErrMissingType = errors.New("protocol: missing type")
-		return Envelope{},ErrMissingType
+		return Envelope{}, ErrMissingType
 	}
 	return e, nil
 }
