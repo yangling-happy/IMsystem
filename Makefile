@@ -4,8 +4,9 @@ GO      := go
 SERVER  := ./cmd/server
 CLIENT  := ./cmd/client
 BIN_DIR := bin
+COMPOSE := docker compose -f deploy/docker-compose.yml
 
-.PHONY: all build build-server build-client run-server run-client clean vet fmt tidy
+.PHONY: all build build-server build-client run-server run-client clean vet fmt tidy test up down
 
 all: build
 
@@ -38,3 +39,12 @@ tidy:
 # 清理构建产物
 clean:
 	rm -rf $(BIN_DIR) chatserver chatserver.exe
+
+test:
+	$(GO) test ./...
+
+up:
+	$(COMPOSE) up -d
+
+down:
+	$(COMPOSE) down
