@@ -1,9 +1,15 @@
 package main
 
 import (
-	"flag"
+	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net"
+	"time"
+
+	"imsystem/internal/model"
+	"imsystem/internal/protocol"
 )
 
 type Client struct {
@@ -27,6 +33,27 @@ func NewClient(serverIP string, serverPort int) (*Client, error) {
 		choice:     99,
 	}, nil
 }
+
+// send 编码成一行 JSON 后写出。所有发送路径都必须经过这里，
+// 避免出现"某处还在用旧字符串协议"的半吊子状态。
+func (client *Client) send(env protocol.Envelope) error {
+	b, err := protocol.Encode(env)
+	if err != nil {
+		return err
+	}
+	_, err = client.conn.Write(b)
+	return err
+}
+
+// newMsgID 生成消息唯一标识，P3 的幂等去重和 ACK 都靠它。
+func newMsgID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
 func (client *Client) Menu() bool {
 	var choice int
 	fmt.Println("请选择功能:")
@@ -44,14 +71,14 @@ func (client *Client) Menu() bool {
 		return false
 	}
 }
+
 func (client *Client) SelectUser() {
-	sendMsg := "who\n"
-	_, err := client.conn.Write([]byte(sendMsg))
-	if err != nil {
+	if err := client.send(protocol.Envelope{Type: protocol.TypeWho}); err != nil {
 		fmt.Println("发送消息错误:", err)
 		return
 	}
 }
+
 func (client *Client) PrivateChat() {
 	var remoteName string
 	var chatMsg string
@@ -65,9 +92,14 @@ func (client *Client) PrivateChat() {
 
 		for chatMsg != "exit" {
 			if len(chatMsg) != 0 {
-				sendMsg := "to|" + remoteName + "|" + chatMsg + "\n"
-				_, err := client.conn.Write([]byte(sendMsg))
-				if err != nil {
+				env := protocol.Envelope{
+					Type:     protocol.TypeChat,
+					MsgID:    newMsgID(),
+					To:       remoteName,
+					ChatType: string(model.ChatSingle),
+					Body:     chatMsg,
+				}
+				if err := client.send(env); err != nil {
 					fmt.Println("发送消息错误:", err)
 					break
 				}
@@ -81,6 +113,7 @@ func (client *Client) PrivateChat() {
 		fmt.Scanln(&remoteName)
 	}
 }
+
 func (client *Client) PublicChat() {
 	var chatMsg string
 	fmt.Println("请输入聊天内容,输入exit退出")
@@ -88,9 +121,13 @@ func (client *Client) PublicChat() {
 
 	for chatMsg != "exit" {
 		if len(chatMsg) != 0 {
-			sendMsg := chatMsg + "\n"
-			_, err := client.conn.Write([]byte(sendMsg))
-			if err != nil {
+			env := protocol.Envelope{
+				Type:     protocol.TypeChat,
+				MsgID:    newMsgID(),
+				ChatType: string(model.ChatGroup),
+				Body:     chatMsg,
+			}
+			if err := client.send(env); err != nil {
 				fmt.Println("发送消息错误:", err)
 				break
 			}
@@ -100,30 +137,41 @@ func (client *Client) PublicChat() {
 		fmt.Scanln(&chatMsg)
 	}
 }
+
 func (client *Client) Update() bool {
 	fmt.Println("请输入用户名:")
 	fmt.Scanln(&client.Name)
 
-	sendMsg := "rename|" + client.Name + "\n"
-	_, err := client.conn.Write([]byte(sendMsg))
-	if err != nil {
+	env := protocol.Envelope{Type: protocol.TypeRename, Body: client.Name}
+	if err := client.send(env); err != nil {
 		fmt.Println("发送消息错误:", err)
 		return false
 	}
 	return true
 }
 
-// ReadServer 读取服务器发回的消息
+// ReadServer 逐行读取服务器报文并渲染
 func (client *Client) ReadServer() {
-	buf := make([]byte, 4096)
-	for {
-		n, err := client.conn.Read(buf)
+	scanner := bufio.NewScanner(client.conn)
+	scanner.Buffer(make([]byte, 0, 1024), 64*1024)
+
+	for scanner.Scan() {
+		env, err := protocol.Decode(scanner.Bytes())
 		if err != nil {
-			fmt.Println("与服务器断开连接:", err)
-			return
+			continue
 		}
-		fmt.Print(string(buf[:n]))
+		switch env.Type {
+		case protocol.TypeChat:
+			if env.ChatType == string(model.ChatGroup) {
+				fmt.Printf("[公聊] %s: %s\n", env.From, env.Body)
+			} else {
+				fmt.Printf("[私聊] %s -> %s: %s\n", env.From, env.To, env.Body)
+			}
+		default:
+			fmt.Println(env.Body)
+		}
 	}
+	fmt.Println("与服务器断开连接:", scanner.Err())
 }
 
 func (client *Client) Run() {
@@ -134,20 +182,17 @@ func (client *Client) Run() {
 		case 1:
 			fmt.Println("公聊")
 			client.PublicChat()
-			break
 		case 2:
 			fmt.Println("私聊")
 			client.PrivateChat()
-			break
 		case 3:
 			fmt.Println("更新用户名")
 			client.Update()
-			break
 		}
 	}
 }
+
 func main() {
-	flag.Parse()
 	client, err := NewClient("127.0.0.1", 8888)
 	if err != nil {
 		fmt.Println("连接服务器失败:", err)

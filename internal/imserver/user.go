@@ -1,13 +1,17 @@
 package imserver
 
-import "net"
+import (
+	"net"
+
+	"imsystem/internal/protocol"
+)
 
 // User 只负责一条连接的读写，不关心 Server 的存在
 type User struct {
 	Name string
 	Addr string
 	conn net.Conn
-	send chan string
+	send chan protocol.Envelope
 }
 
 func NewUser(conn net.Conn) *User {
@@ -16,16 +20,16 @@ func NewUser(conn net.Conn) *User {
 		Name: addr,
 		Addr: addr,
 		conn: conn,
-		send: make(chan string, 16),
+		send: make(chan protocol.Envelope, 16),
 	}
 }
 
-// Send 把消息塞进发送队列
-func (u *User) Send(msg string) {
+// Send 把报文塞进发送队列
+func (u *User) Send(env protocol.Envelope) {
 	select {
-	case u.send <- msg:
+	case u.send <- env:
 	default:
-		// 队列满则丢弃，避免阻塞广播
+		// 队列满则丢弃，避免阻塞广播（P3 用缓冲队列 + 指标解决）
 	}
 }
 
@@ -33,9 +37,15 @@ func (u *User) Close() {
 	u.conn.Close()
 }
 
-// WriteLoop 把 send 队列里的消息持续写给客户端，直到 send 被关闭
+// WriteLoop 把 send 队列里的报文编码后持续写给客户端，直到 send 被关闭
 func (u *User) WriteLoop() {
-	for msg := range u.send {
-		u.conn.Write([]byte(msg))
+	for env := range u.send {
+		b, err := protocol.Encode(env)
+		if err != nil {
+			continue
+		}
+		if _, err := u.conn.Write(b); err != nil {
+			return
+		}
 	}
 }
