@@ -6,6 +6,9 @@ import (
 	"net"
 	"strconv"
 	"syscall"
+	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"imsystem/internal/config"
 	"imsystem/internal/imserver"
@@ -29,7 +32,21 @@ func main() {
 	}
 	defer repo.Close()
 
-	q := queue.NewMemoryQueue(cfg.SendQueueSize)
+	// Redis 客户端内部自带连接池，这里只给地址和密码
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     cfg.RedisAddr,
+		Password: cfg.RedisPass,
+	})
+	defer rdb.Close()
+
+	// 和 MySQL 一样，启动就探活：Redis 不通时服务端跑起来只会把消息全丢在 Push 失败里
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelPing()
+	if err := rdb.Ping(pingCtx).Err(); err != nil {
+		log.Fatalf("连接 Redis 失败: %v", err)
+	}
+
+	q := queue.NewRedisQueue(rdb, queue.MessageQueueKey)
 
 	// Worker 跑在独立协程里：网络读循环只负责入队，落库慢/失败都不影响收发
 	ctx, cancel := context.WithCancel(context.Background())
