@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"imsystem/internal/delayed"
 	"imsystem/internal/model"
 	"imsystem/internal/protocol"
 	"imsystem/internal/queue"
@@ -26,7 +27,28 @@ const (
 
 	// closeDelay 让写协程有机会把"被断开"的提示刷出去，再真正关闭连接。
 	closeDelay = 100 * time.Millisecond
+
+	// dispatchInterval 是离线消息补投的轮询间隔。
+	dispatchInterval = 500 * time.Millisecond
+	// dispatchBatch 是单轮最多取多少条，避免一轮做太久拖慢下一轮。
+	dispatchBatch = 20
+	// retryBaseDelay 是首次退避等待，之后按 2 倍递增。
+	retryBaseDelay = time.Second
+	// maxBackoffShift 限制退避的翻倍次数。
+	maxBackoffShift = 3
+	// retryMaxDelay 是退避上限。
+	// 不宜设大：轮询本来就每 500ms 扫一次 ZSET，退避不省 Redis 开销，
+	// 却会把"用户刚上线"的补投延迟拖到这个值。5 秒是延迟与压力的折中。
+	retryMaxDelay = 5 * time.Second
+	// delayedOpTimeout 是单次 Redis 操作的上限。
+	delayedOpTimeout = 200 * time.Millisecond
 )
+
+// DelayedQueue 是离线消息延迟队列的抽象，实现是 delayed.Queue。
+type DelayedQueue interface {
+	Push(ctx context.Context, t delayed.Task, readyAt time.Time) error
+	PopDue(ctx context.Context, now time.Time, limit int) ([]delayed.Task, error)
+}
 
 // Server 是用户管理与消息分发的中枢
 type Server struct {
@@ -39,6 +61,9 @@ type Server struct {
 	// Sink 是消息入队口，nil 表示不持久化（P0 的无存储模式）。
 	// 由 cmd/server 注入，imserver 不关心背后是内存队列还是 Redis。
 	Sink queue.Sink
+
+	// Delayed 是离线消息延迟队列，nil 表示不支持离线补投。
+	Delayed DelayedQueue
 
 	users   map[string]*User
 	usersMu sync.RWMutex
@@ -64,6 +89,11 @@ func (s *Server) Start() {
 
 	// 心跳巡检：独立协程，不阻塞网络读写
 	go s.kickIdle()
+
+	// 离线消息补投：独立协程，每隔 dispatchInterval 看一次有没有到期任务
+	if s.Delayed != nil {
+		go s.dispatchLoop()
+	}
 
 	for {
 		conn, err := listener.Accept()
@@ -295,7 +325,8 @@ func (s *Server) sendTo(sender *User, env protocol.Envelope) {
 	from := sender.Name
 	s.usersMu.RUnlock()
 	if !ok {
-		sender.Send(protocol.Envelope{Type: protocol.TypeNotice, Body: "当前用户不存在"})
+		// 对方不在线：不丢消息，转成离线任务等对方上线再补投
+		s.delayOffline(sender, env, from)
 		return
 	}
 	target.Send(protocol.Envelope{
@@ -306,4 +337,95 @@ func (s *Server) sendTo(sender *User, env protocol.Envelope) {
 		ChatType: string(model.ChatSingle),
 		Body:     env.Body,
 	})
+}
+
+// ---- 离线消息 ----
+
+// delayOffline 对方不在线时，把消息写进延迟队列等对方上线补投。
+// 这条消息同时也已经由 enqueue 落了库，所以即使服务重启也不会丢。
+func (s *Server) delayOffline(sender *User, env protocol.Envelope, from string) {
+	if s.Delayed == nil {
+		sender.Send(protocol.Envelope{Type: protocol.TypeNotice, Body: "当前用户不存在"})
+		return
+	}
+
+	m := model.Message{
+		MsgID:    env.MsgID,
+		From:     from,
+		To:       env.To,
+		ChatType: model.ChatSingle,
+		Body:     env.Body,
+		SentAt:   time.Now(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), delayedOpTimeout)
+	defer cancel()
+	if err := s.Delayed.Push(ctx, delayed.Task{Message: m}, time.Now()); err != nil {
+		log.Printf("离线消息入队失败 msg_id=%s err=%v", m.MsgID, err)
+		sender.Send(protocol.Envelope{Type: protocol.TypeNotice, Body: "离线消息入队失败，请重发"})
+		return
+	}
+	sender.Send(protocol.Envelope{Type: protocol.TypeNotice, Body: "对方不在线，消息已存入离线队列"})
+}
+
+// dispatchLoop 周期性取出到期任务并补投。
+func (s *Server) dispatchLoop() {
+	ticker := time.NewTicker(dispatchInterval)
+	defer ticker.Stop()
+
+	ctx := context.Background()
+	for range ticker.C {
+		tasks, err := s.Delayed.PopDue(ctx, time.Now(), dispatchBatch)
+		if err != nil {
+			log.Printf("取离线消息失败: %v", err)
+			continue
+		}
+		for _, t := range tasks {
+			// 投递成功就不管了；对方仍不在线则重新排队等下次
+			if s.deliverOffline(t.Message) {
+				continue
+			}
+			s.retryLater(ctx, t)
+		}
+	}
+}
+
+// deliverOffline 尝试把一条离线消息发给在线的接收人，返回是否成功。
+func (s *Server) deliverOffline(m model.Message) bool {
+	s.usersMu.RLock()
+	target, ok := s.users[m.To]
+	s.usersMu.RUnlock()
+	if !ok {
+		return false
+	}
+	target.Send(protocol.Envelope{
+		Type:     protocol.TypeChat,
+		MsgID:    m.MsgID,
+		From:     m.From,
+		To:       m.To,
+		ChatType: string(m.ChatType),
+		Body:     m.Body,
+	})
+	return true
+}
+
+// retryLater 把任务以更晚的 readyAt 重新入队。
+// 不设"放弃次数"：离线消息只有对方上线才能送达，提前放弃等于永久丢消息。
+// 只用退避上限控制轮询压力，长期不上线的用户最多每 30 秒试一次。
+func (s *Server) retryLater(ctx context.Context, t delayed.Task) {
+	next := t.Attempt + 1
+	shift := next - 1
+	if shift > maxBackoffShift {
+		shift = maxBackoffShift
+	}
+	delay := retryBaseDelay << shift
+	if delay > retryMaxDelay {
+		delay = retryMaxDelay
+	}
+
+	opCtx, cancel := context.WithTimeout(ctx, delayedOpTimeout)
+	defer cancel()
+	if err := s.Delayed.Push(opCtx, delayed.Task{Message: t.Message, Attempt: next}, time.Now().Add(delay)); err != nil {
+		log.Printf("离线消息重排失败 msg_id=%s err=%v", t.Message.MsgID, err)
+	}
 }

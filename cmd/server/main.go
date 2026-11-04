@@ -11,6 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"imsystem/internal/config"
+	"imsystem/internal/delayed"
 	"imsystem/internal/imserver"
 	"imsystem/internal/queue"
 	"imsystem/internal/storage"
@@ -47,6 +48,7 @@ func main() {
 	}
 
 	q := queue.NewRedisQueue(rdb, queue.MessageQueueKey)
+	delayedQ := delayed.New(rdb, delayed.Key)
 
 	// Worker 跑在独立协程里：网络读循环只负责入队，落库慢/失败都不影响收发
 	ctx, cancel := context.WithCancel(context.Background())
@@ -65,5 +67,6 @@ func main() {
 	server := imserver.NewServer(host, port)
 	server.HeartbeatTimeout = cfg.HeartbeatTimeout
 	server.Sink = q
+	server.Delayed = delayedQ
 	server.Start()
 }
