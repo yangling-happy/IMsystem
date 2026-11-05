@@ -48,6 +48,9 @@ const (
 	// enqueueTimeout 是入队上限。不能太小：突发流量时 Redis 连接池要扩容，
 	// 冷连接一次握手就可能超过 50ms，超时即丢消息（实测踩到过）。
 	enqueueTimeout = 300 * time.Millisecond
+	// maxBodyBytes 是聊天正文上限。整行上限是 maxLineBytes（64KB），
+	// 但聊天正文没必要那么大：给 msg_id/from/to 等字段留足空间后取 4KB。
+	maxBodyBytes = 4 * 1024
 )
 
 // DelayedQueue 是离线消息延迟队列的抽象，实现是 delayed.Queue。
@@ -79,6 +82,9 @@ type Server struct {
 
 	users   map[string]*User
 	usersMu sync.RWMutex
+
+	// ln 是监听句柄，Close() 通过关闭它让 Start() 的 Accept 返回 net.ErrClosed。
+	ln net.Listener
 }
 
 // RateLimiter 是限流抽象，实现是 limiter.Limiter。
@@ -100,13 +106,12 @@ func NewServer(ip string, port int) *Server {
 	}
 }
 
-func (s *Server) Start() {
+func (s *Server) Start() error {
 	listener, err := net.Listen("tcp", net.JoinHostPort(s.Ip, fmt.Sprintf("%d", s.Port)))
 	if err != nil {
-		fmt.Println("启动服务器失败:", err)
-		return
+		return fmt.Errorf("启动服务器失败: %w", err)
 	}
-	defer listener.Close()
+	s.ln = listener
 	fmt.Printf("服务器监听 %s:%d\n", s.Ip, s.Port)
 
 	// 心跳巡检：独立协程，不阻塞网络读写
@@ -120,11 +125,33 @@ func (s *Server) Start() {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Println("接受连接失败:", err)
-			continue
+			// Close() 主动关闭监听时 Accept 会返回 net.ErrClosed，这是正常退出路径
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("接受连接失败: %w", err)
 		}
 		go s.handleConn(conn)
 	}
+}
+
+// Close 停止接收新连接，并关掉所有在线连接，让各协程的读循环退出。
+func (s *Server) Close() error {
+	if s.ln == nil {
+		return nil
+	}
+	err := s.ln.Close()
+
+	s.usersMu.Lock()
+	users := make([]*User, 0, len(s.users))
+	for _, u := range s.users {
+		users = append(users, u)
+	}
+	s.usersMu.Unlock()
+	for _, u := range users {
+		u.Close()
+	}
+	return err
 }
 
 // handleConn 处理一条连接的完整生命周期。
@@ -229,6 +256,16 @@ func (s *Server) handleEnvelope(user *User, env protocol.Envelope) {
 	case protocol.TypeRename:
 		s.rename(user, env.Body)
 	case protocol.TypeChat:
+		// 正文超长直接拒绝并回提示，但不断连：断连会让用户丢掉
+		// 正在输入的上下文，而且这条消息本身也没有值得罚断线的恶意。
+		if len(env.Body) > maxBodyBytes {
+			user.Send(protocol.Envelope{
+				Type:  protocol.TypeNotice,
+				MsgID: env.MsgID,
+				Body:  fmt.Sprintf("消息内容过长（上限 %d 字节）", maxBodyBytes),
+			})
+			return
+		}
 		// 限流只作用于聊天：心跳、改名、查询不能被限流拖死
 		if !s.allowSend(user) {
 			metrics.RateLimitedTotal.Inc()

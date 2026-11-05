@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 	"net"
+	"os"
+	"os/signal"
 	"strconv"
 	"syscall"
 	"time"
@@ -58,9 +60,12 @@ func main() {
 	// 指标独立端口：Prometheus 抓 :9091/metrics
 	metrics.Serve(cfg.MetricsAddr)
 
+	// ctx 是整个进程的生命周期：收到 Ctrl+C / SIGTERM 时取消，
+	// Worker 也随之退出，避免 main 返回后还有协程在写库。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	// Worker 跑在独立协程里：网络读循环只负责入队，落库慢/失败都不影响收发
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	go queue.NewWorker(repo).Run(ctx, q)
 
 	host, portStr, err := net.SplitHostPort(cfg.Addr)
@@ -78,5 +83,30 @@ func main() {
 	server.Delayed = delayedQ
 	server.Limiter = rateLimiter
 	server.Dedupe = dedupeGate
-	server.Start()
+
+	// Start 会阻塞在 Accept，所以放协程里跑；主协程只等退出信号
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		if err := server.Start(); err != nil {
+			log.Printf("服务端异常退出: %v", err)
+			stop()
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("收到退出信号，开始优雅关闭")
+
+	// 先关监听和所有在线连接：不再进新消息，各读协程自然退出
+	if err := server.Close(); err != nil {
+		log.Printf("关闭监听失败: %v", err)
+	}
+	<-serverDone
+
+	// 给 Worker 一点时间把已取出但还没落库的消息写完，再取消 ctx
+	time.Sleep(200 * time.Millisecond)
+	stop()
+
+	// 退出前关掉外部资源（defer 里的 repo.Close/rdb.Close 现在才真正执行到）
+	log.Println("服务已停止")
 }

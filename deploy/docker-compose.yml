@@ -35,6 +35,8 @@ services:
       - "3000:3000"
     volumes:
       - grafana-data:/var/lib/grafana
+      # 数据源与看板由配置文件自动装载，首次启动就可用，无需手动点 UI
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
 
 volumes:
   redis-data:
