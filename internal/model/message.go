@@ -13,10 +13,10 @@ const (
 
 // Message 是一条待投递/已投递的聊天消息，MsgID 由发送方生成，用于幂等去重。
 type Message struct {
-	MsgID    string   `json:"msg_id"`
-	From     string   `json:"from"`
-	To       string   `json:"to"`
-	ChatType ChatType `json:"chat_type"`
-	Body     string   `json:"body"`
+	MsgID    string    `json:"msg_id"`
+	From     string    `json:"from"`
+	To       string    `json:"to"`
+	ChatType ChatType  `json:"chat_type"`
+	Body     string    `json:"body"`
 	SentAt   time.Time `json:"sent_at"`
 }

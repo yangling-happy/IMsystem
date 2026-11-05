@@ -15,6 +15,7 @@ const (
 	TypeRename    = "rename"    // 改名
 	TypeHeartbeat = "heartbeat" // 心跳，仅用于维持连接活跃
 	TypeNotice    = "notice"    // 服务端下发的系统提示
+	TypeAck       = "ack"       // 服务端确认"消息已受理"，客户端据此停止重发
 )
 
 // Envelope 是传输层的一条报文。

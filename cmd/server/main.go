@@ -11,8 +11,11 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"imsystem/internal/config"
+	"imsystem/internal/dedupe"
 	"imsystem/internal/delayed"
 	"imsystem/internal/imserver"
+	"imsystem/internal/limiter"
+	"imsystem/internal/metrics"
 	"imsystem/internal/queue"
 	"imsystem/internal/storage"
 )
@@ -49,6 +52,11 @@ func main() {
 
 	q := queue.NewRedisQueue(rdb, queue.MessageQueueKey)
 	delayedQ := delayed.New(rdb, delayed.Key)
+	rateLimiter := limiter.New(rdb, cfg.RateLimitPerSec, time.Second)
+	dedupeGate := dedupe.New(rdb)
+
+	// 指标独立端口：Prometheus 抓 :9091/metrics
+	metrics.Serve(cfg.MetricsAddr)
 
 	// Worker 跑在独立协程里：网络读循环只负责入队，落库慢/失败都不影响收发
 	ctx, cancel := context.WithCancel(context.Background())
@@ -68,5 +76,7 @@ func main() {
 	server.HeartbeatTimeout = cfg.HeartbeatTimeout
 	server.Sink = q
 	server.Delayed = delayedQ
+	server.Limiter = rateLimiter
+	server.Dedupe = dedupeGate
 	server.Start()
 }

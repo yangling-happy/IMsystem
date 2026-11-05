@@ -6,11 +6,33 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"imsystem/internal/model"
 	"imsystem/internal/protocol"
 )
+
+const (
+	// ackTimeout 是等 ACK 的时长：超过就重发。
+	ackTimeout = 2 * time.Second
+	// maxSendRetry 是最多重发次数，用完就放弃并提示用户。
+	maxSendRetry = 3
+	// clientHeartbeatEvery 是客户端心跳间隔。服务端超时默认 90 秒，
+	// 30 秒发一次意味着允许连续丢 2 次心跳仍不误杀。
+	clientHeartbeatEvery = 30 * time.Second
+)
+
+type pendingMsg struct {
+	env     protocol.Envelope
+	attempt int
+	last    time.Time
+}
+
+type retryItem struct {
+	env     protocol.Envelope
+	attempt int
+}
 
 type Client struct {
 	ServerIP   string
@@ -18,6 +40,11 @@ type Client struct {
 	Name       string
 	conn       net.Conn
 	choice     int
+
+	// mu 保护 pending 与 seen：读协程和重试协程都会访问
+	mu      sync.Mutex
+	pending map[string]*pendingMsg
+	seen    map[string]bool
 }
 
 // NewClient 建立与服务器的 TCP 连接
@@ -31,6 +58,8 @@ func NewClient(serverIP string, serverPort int) (*Client, error) {
 		ServerPort: serverPort,
 		conn:       conn,
 		choice:     99,
+		pending:    make(map[string]*pendingMsg),
+		seen:       make(map[string]bool),
 	}, nil
 }
 
@@ -45,7 +74,77 @@ func (client *Client) send(env protocol.Envelope) error {
 	return err
 }
 
-// newMsgID 生成消息唯一标识，P3 的幂等去重和 ACK 都靠它。
+// sendChat 发送聊天消息，并登记为"等 ACK"。
+// msg_id 只在这里生成一次；重发必须复用，否则服务端会当成一条新消息。
+func (client *Client) sendChat(env protocol.Envelope) error {
+	if env.MsgID == "" {
+		env.MsgID = newMsgID()
+	}
+
+	client.mu.Lock()
+	client.pending[env.MsgID] = &pendingMsg{env: env, last: time.Now()}
+	client.mu.Unlock()
+
+	return client.send(env)
+}
+
+// AckLoop 扫描迟迟没收到 ACK 的消息并重发。
+func (client *Client) AckLoop() {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		var retries []retryItem
+		client.mu.Lock()
+		for id, p := range client.pending {
+			if time.Since(p.last) < ackTimeout {
+				continue
+			}
+			if p.attempt >= maxSendRetry {
+				delete(client.pending, id)
+				fmt.Printf("[超时] 消息 %s 未收到 ACK，已重试 %d 次，放弃\n", id, p.attempt)
+				continue
+			}
+			p.attempt++
+			p.last = time.Now()
+			retries = append(retries, retryItem{env: p.env, attempt: p.attempt})
+		}
+		client.mu.Unlock()
+
+		for _, r := range retries {
+			fmt.Printf("[重试] msg_id=%s 第 %d 次重发\n", r.env.MsgID, r.attempt)
+			if err := client.send(r.env); err != nil {
+				fmt.Println("重发失败:", err)
+			}
+		}
+	}
+}
+
+// markAcked 收到服务端 ACK 后，把消息从待确认表里删掉。
+func (client *Client) markAcked(msgID string) {
+	if msgID == "" {
+		return
+	}
+	client.mu.Lock()
+	delete(client.pending, msgID)
+	client.mu.Unlock()
+}
+
+// markSeen 做接收端去重：同一条消息被重复投递时只展示一次。
+func (client *Client) markSeen(msgID string) bool {
+	if msgID == "" {
+		return true
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.seen[msgID] {
+		return false
+	}
+	client.seen[msgID] = true
+	return true
+}
+
+// newMsgID 生成消息唯一标识，幂等去重和 ACK 都靠它。
 func newMsgID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
@@ -94,12 +193,11 @@ func (client *Client) PrivateChat() {
 			if len(chatMsg) != 0 {
 				env := protocol.Envelope{
 					Type:     protocol.TypeChat,
-					MsgID:    newMsgID(),
 					To:       remoteName,
 					ChatType: string(model.ChatSingle),
 					Body:     chatMsg,
 				}
-				if err := client.send(env); err != nil {
+				if err := client.sendChat(env); err != nil {
 					fmt.Println("发送消息错误:", err)
 					break
 				}
@@ -123,11 +221,10 @@ func (client *Client) PublicChat() {
 		if len(chatMsg) != 0 {
 			env := protocol.Envelope{
 				Type:     protocol.TypeChat,
-				MsgID:    newMsgID(),
 				ChatType: string(model.ChatGroup),
 				Body:     chatMsg,
 			}
-			if err := client.send(env); err != nil {
+			if err := client.sendChat(env); err != nil {
 				fmt.Println("发送消息错误:", err)
 				break
 			}
@@ -150,14 +247,10 @@ func (client *Client) Update() bool {
 	return true
 }
 
-// heartbeatEvery 是客户端心跳间隔。服务端超时默认 90 秒，
+// clientHeartbeatEvery 是客户端心跳间隔。服务端超时默认 90 秒，
 // 30 秒发一次意味着允许连续丢 2 次心跳仍不误杀。
-const heartbeatEvery = 30 * time.Second
-
-// HeartbeatLoop 定时发送心跳，让服务端知道"我还活着"。
-// 心跳本身不携带业务数据，它存在的唯一目的是刷新服务端的活跃时间。
 func (client *Client) HeartbeatLoop() {
-	ticker := time.NewTicker(heartbeatEvery)
+	ticker := time.NewTicker(clientHeartbeatEvery)
 	defer ticker.Stop()
 	for range ticker.C {
 		if err := client.send(protocol.Envelope{Type: protocol.TypeHeartbeat}); err != nil {
@@ -179,7 +272,13 @@ func (client *Client) ReadServer() {
 		switch env.Type {
 		case protocol.TypeHeartbeat:
 			// 服务端目前不回心跳；留这个分支是为了协议对称
+		case protocol.TypeAck:
+			client.markAcked(env.MsgID)
 		case protocol.TypeChat:
+			// 重复投递只显示一次（服务端重试可能让同一条到达两次）
+			if !client.markSeen(env.MsgID) {
+				continue
+			}
 			if env.ChatType == string(model.ChatGroup) {
 				fmt.Printf("[公聊] %s: %s\n", env.From, env.Body)
 			} else {
@@ -219,6 +318,7 @@ func main() {
 	defer client.conn.Close()
 	fmt.Println("连接服务器成功!")
 	go client.HeartbeatLoop()
+	go client.AckLoop()
 	go client.ReadServer()
 	client.Run()
 }

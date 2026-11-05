@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"imsystem/internal/delayed"
+	"imsystem/internal/metrics"
 	"imsystem/internal/model"
 	"imsystem/internal/protocol"
 	"imsystem/internal/queue"
@@ -42,6 +43,11 @@ const (
 	retryMaxDelay = 5 * time.Second
 	// delayedOpTimeout 是单次 Redis 操作的上限。
 	delayedOpTimeout = 200 * time.Millisecond
+	// limiterOpTimeout 更短：限流在请求路径上，不能把用户发送拖慢。
+	limiterOpTimeout = 100 * time.Millisecond
+	// enqueueTimeout 是入队上限。不能太小：突发流量时 Redis 连接池要扩容，
+	// 冷连接一次握手就可能超过 50ms，超时即丢消息（实测踩到过）。
+	enqueueTimeout = 300 * time.Millisecond
 )
 
 // DelayedQueue 是离线消息延迟队列的抽象，实现是 delayed.Queue。
@@ -65,8 +71,24 @@ type Server struct {
 	// Delayed 是离线消息延迟队列，nil 表示不支持离线补投。
 	Delayed DelayedQueue
 
+	// Limiter 是发送限流器，nil 表示不限流。
+	Limiter RateLimiter
+
+	// Dedupe 是消息幂等检查器，nil 表示不做去重。
+	Dedupe MessageDedupe
+
 	users   map[string]*User
 	usersMu sync.RWMutex
+}
+
+// RateLimiter 是限流抽象，实现是 limiter.Limiter。
+type RateLimiter interface {
+	Allow(ctx context.Context, key string) (bool, error)
+}
+
+// MessageDedupe 是消息幂等抽象，实现是 dedupe.Dedupe。
+type MessageDedupe interface {
+	Seen(ctx context.Context, msgID string) (bool, error)
 }
 
 func NewServer(ip string, port int) *Server {
@@ -111,7 +133,11 @@ func (s *Server) Start() {
 func (s *Server) handleConn(conn net.Conn) {
 	user := NewUser(conn)
 	s.addUser(user)
-	defer s.removeUser(user)
+	metrics.OnlineUsers.Inc()
+	defer func() {
+		metrics.OnlineUsers.Dec()
+		s.removeUser(user)
+	}()
 
 	go user.WriteLoop()
 	defer user.CloseSend()
@@ -196,18 +222,48 @@ func (s *Server) handleEnvelope(user *User, env protocol.Envelope) {
 	switch env.Type {
 	case protocol.TypeHeartbeat:
 		// 心跳只需要刷新活跃时间（已在读循环里做过），不做业务分发
+	case protocol.TypeAck:
+		// ACK 的方向是服务端 -> 客户端；客户端发来的 ACK 不需要处理
 	case protocol.TypeWho:
 		s.listUsers(user)
 	case protocol.TypeRename:
 		s.rename(user, env.Body)
 	case protocol.TypeChat:
+		// 限流只作用于聊天：心跳、改名、查询不能被限流拖死
+		if !s.allowSend(user) {
+			metrics.RateLimitedTotal.Inc()
+			user.Send(protocol.Envelope{
+				Type: protocol.TypeNotice,
+				Body: "发送太快了，请稍后再试",
+			})
+			return
+		}
+
+		// 幂等前置拦截：客户端重试会带着同一个 msg_id 再来一次，
+		// 这里挡掉就不会重复投递、重复入库。
+		if s.isDuplicate(user, env) {
+			// 重复消息也必须回 ACK，否则客户端收不到确认会一直重发
+			s.sendAck(user, env)
+			return
+		}
+
 		if env.To == "" {
 			s.broadcastChat(user, env)
 		} else {
 			s.sendTo(user, env)
 		}
 		// 先投递再入队：投递是同步的（用户等着看消息），落库是异步的（不阻塞读循环）
-		s.enqueue(user, env)
+		if err := s.enqueue(user, env); err != nil {
+			user.Send(protocol.Envelope{
+				Type: protocol.TypeNotice,
+				Body: "服务端繁忙，消息未入队，请稍后重试",
+			})
+			return
+		}
+
+		metrics.MessagesTotal.WithLabelValues("ok").Inc()
+		// 受理成功才回 ACK：客户端收到才算发成功，没收到就重发同一个 msg_id
+		s.sendAck(user, env)
 	default:
 		user.Send(protocol.Envelope{
 			Type: protocol.TypeNotice,
@@ -218,9 +274,9 @@ func (s *Server) handleEnvelope(user *User, env protocol.Envelope) {
 
 // enqueue 把聊天消息转成 model.Message 并塞进缓冲队列。
 // 这里绝不能阻塞：读循环一旦被存储拖慢，整个连接的消息处理都会卡住。
-func (s *Server) enqueue(user *User, env protocol.Envelope) {
+func (s *Server) enqueue(user *User, env protocol.Envelope) error {
 	if s.Sink == nil {
-		return
+		return nil
 	}
 	chatType := model.ChatSingle
 	if env.To == "" {
@@ -240,11 +296,49 @@ func (s *Server) enqueue(user *User, env protocol.Envelope) {
 		SentAt:   time.Now(),
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), enqueueTimeout)
 	defer cancel()
 	if err := s.Sink.Push(ctx, m); err != nil {
 		log.Printf("消息入队失败 msg_id=%s err=%v", m.MsgID, err)
+		return err
 	}
+	return nil
+}
+
+// isDuplicate 查消息是否重复。Redis 故障时放行（fail-open）：
+// 还有 MySQL 唯一索引兜底，宁可放过去也不能把正常消息全挡死。
+func (s *Server) isDuplicate(user *User, env protocol.Envelope) bool {
+	if s.Dedupe == nil || env.MsgID == "" {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), limiterOpTimeout)
+	defer cancel()
+	dup, err := s.Dedupe.Seen(ctx, env.MsgID)
+	if err != nil {
+		log.Printf("幂等检查失败，按未重复处理 msg_id=%s err=%v", env.MsgID, err)
+		return false
+	}
+	if !dup {
+		return false
+	}
+
+	metrics.DuplicateTotal.Inc()
+	user.Send(protocol.Envelope{
+		Type:  protocol.TypeNotice,
+		MsgID: env.MsgID,
+		Body:  "重复消息已忽略",
+	})
+	return true
+}
+
+// sendAck 告诉发送方"服务端已受理"。
+// 没有 msg_id 的消息无法被重试追踪，也就不需要 ACK。
+func (s *Server) sendAck(user *User, env protocol.Envelope) {
+	if env.MsgID == "" {
+		return
+	}
+	user.Send(protocol.Envelope{Type: protocol.TypeAck, MsgID: env.MsgID})
 }
 
 // broadcastNotice 向所有在线用户下发系统提示（上下线、错误等）
@@ -337,6 +431,27 @@ func (s *Server) sendTo(sender *User, env protocol.Envelope) {
 		ChatType: string(model.ChatSingle),
 		Body:     env.Body,
 	})
+}
+
+// allowSend 查限流。Redis 故障时放行（fail-open）：
+// 限流是用来防刷的，不属于消息正确性，不能因为它把正常用户挡在门外。
+func (s *Server) allowSend(user *User) bool {
+	if s.Limiter == nil {
+		return true
+	}
+
+	s.usersMu.RLock()
+	key := user.Name
+	s.usersMu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), limiterOpTimeout)
+	defer cancel()
+	ok, err := s.Limiter.Allow(ctx, key)
+	if err != nil {
+		log.Printf("限流器异常，按放行处理: %v", err)
+		return true
+	}
+	return ok
 }
 
 // ---- 离线消息 ----

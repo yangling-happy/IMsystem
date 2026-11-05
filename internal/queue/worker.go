@@ -6,6 +6,7 @@ import (
 	"log"
 	"time"
 
+	"imsystem/internal/metrics"
 	"imsystem/internal/model"
 	"imsystem/internal/storage"
 )
@@ -77,9 +78,12 @@ func (w *Worker) Run(ctx context.Context, src Source) {
 
 // persist 落库一条消息，带指数退避重试。
 func (w *Worker) persist(ctx context.Context, m model.Message) {
+	start := time.Now()
 	for attempt := 0; attempt <= w.maxRetry; attempt++ {
 		err := w.repo.SaveMessage(ctx, m)
 		if err == nil {
+			metrics.PersistDuration.Observe(time.Since(start).Seconds())
+			metrics.PersistedTotal.Inc()
 			return
 		}
 		// 唯一索引冲突说明这条消息已经落过库，属于幂等命中，不算失败
